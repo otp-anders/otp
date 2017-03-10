@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2010-2016. All Rights Reserved.
+%% Copyright Ericsson AB 2010-2017. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -195,21 +195,22 @@ unique_string() ->
 %% have_sctp/0
 
 have_sctp() ->
-    case erlang:system_info(system_architecture) of
-	%% We do not support the sctp version present in solaris
-	%% version "sparc-sun-solaris2.10", that behaves differently
-	%% from later versions and linux
-	"sparc-sun-solaris2.10" ->
-	    false;
-	_->
-	    case gen_sctp:open() of
-		{ok, Sock} ->
-		    gen_sctp:close(Sock),
-		    true;
-		{error, E} when E == eprotonosupport;
-				E == esocktnosupport -> %% fail on any other reason
-		    false
-	    end
+    have_sctp(erlang:system_info(system_architecture)).
+
+%% We do not support the sctp version present in solaris version
+%% "sparc-sun-solaris2.10", that behaves differently from later
+%% versions and linux.
+have_sctp("sparc-sun-solaris2.10") ->
+    false;
+
+have_sctp(_) ->
+    case gen_sctp:open() of
+        {ok, Sock} ->
+            gen_sctp:close(Sock),
+            true;
+        {error, E} when E == eprotonosupport;
+                        E == esocktnosupport -> %% fail on any other reason
+            false
     end.
 
 %% ---------------------------------------------------------------------------
