@@ -19,7 +19,6 @@
 %%
 
 -module(diameter_tcp).
--dialyzer({no_fail_call, throttle/2}).
 
 -behaviour(gen_server).
 
@@ -53,6 +52,7 @@
 %% Keys into process dictionary.
 -define(INFO_KEY, info).
 -define(REF_KEY,  ref).
+-define(TRANSPORT_KEY, transport).
 
 -define(ERROR(T), erlang:error({T, ?MODULE, ?LINE})).
 
@@ -83,7 +83,8 @@
         {parent :: reference() | false,
          transport = self() :: pid(),
          socket :: inet:socket() | ssl:sslsocket() | undefined,
-         module :: module() | undefined}).
+         module :: module() | undefined,
+         send_cb :: false | diameter:evaluable()}).
 
 -type length() :: 0..16#FFFFFF. %% message length from Diameter header
 -type size()   :: non_neg_integer().  %% accumulated binary size
@@ -108,7 +109,8 @@
 
 -type option() :: {port, non_neg_integer()}
                 | {fragment_timer, 0..16#FFFFFFFF}
-                | {throttle_cb, diameter:evaluable()}.
+                | {recv_cb, diameter:evaluable()}
+                | {send_cb, diameter:evaluable()}.
 
 %% Accepting/connecting transport process state.
 -record(transport,
@@ -120,9 +122,9 @@
          timeout :: infinity | 0..16#FFFFFFFF,  %% fragment timeout
          tref = false  :: false | reference(),  %% fragment timer reference
          flush = false :: boolean(),            %% flush fragment at timeout?
-         throttle_cb :: false | diameter:evaluable(), %% ask to receive
+         recv_cb :: false | diameter:evaluable(), %% ask to read/receive
          throttled :: boolean() | binary(),     %% stopped receiving?
-         monitor   :: pid()}).
+         monitor   :: pid()}).                  %% monitor/sender process
 
 %% The usual transport using gen_tcp can be replaced by anything
 %% sufficiently gen_tcp-like by passing a 'module' option as the first
@@ -211,17 +213,20 @@ i({T, Ref, Mod, Pid, Opts, Addrs, SPid})
     %% Since accept/connect might block indefinitely, spawn a process
     %% that kills us with the parent until call returns, and then
     %% sends outgoing messages.
-    {ok, MPid} = diameter_tcp_sup:start_child(#monitor{parent = Pid}),
     {[SO|TO], Rest} = proplists:split(Opts, [ssl_options,
                                              fragment_timer,
-                                             throttle_cb]),
+                                             recv_cb,
+                                             send_cb]),
     SslOpts = ssl_opts(SO),
     OwnOpts = lists:append(TO),
     Tmo = proplists:get_value(fragment_timer,
                               OwnOpts,
                               ?DEFAULT_FRAGMENT_TIMEOUT),
     ?IS_TIMEOUT(Tmo) orelse ?ERROR({fragment_timer, Tmo}),
-    Throttle = proplists:get_value(throttle_cb, OwnOpts, false),
+    Recv = proplists:get_value(recv_cb, OwnOpts, false),
+    Send = proplists:get_value(send_cb, OwnOpts, false),
+    {ok, MPid} = diameter_tcp_sup:start_child(#monitor{parent = Pid,
+                                                       send_cb = Send}),
     Sock = init(T, Ref, Mod, Pid, SslOpts, Rest, Addrs, SPid),
     M = if SslOpts -> ssl; true -> Mod end,
     monitor(process, MPid),
@@ -232,14 +237,15 @@ i({T, Ref, Mod, Pid, Opts, Addrs, SPid})
                         socket = Sock,
                         ssl = SslOpts,
                         timeout = Tmo,
-                        throttle_cb = Throttle,
-                        throttled = false /= Throttle, 
+                        recv_cb = Recv,
+                        throttled = false /= Recv,
                         monitor = MPid});
 %% Put the reference in the process dictionary since we now use it
 %% advertise the ssl socket after TLS upgrade.
 
 %% A monitor process to kill the transport if the parent dies.
 i(#monitor{parent = Pid, transport = TPid} = S) ->
+    putr(?TRANSPORT_KEY, TPid),
     proc_lib:init_ack({ok, self()}),
     monitor(process, TPid),
     S#monitor{parent = monitor(process, Pid)};
@@ -517,8 +523,7 @@ getr(Key) ->
 %% Outgoing message.
 m(Bin, #monitor{} = S)
   when is_binary(Bin) ->
-    send(Bin, S),
-    S;
+    send(Bin, S);
 
 %% Transport is telling us to be ready to send. Stop monitoring on the
 %% parent so as not to die before a send from the transport.
@@ -843,20 +848,86 @@ connect(Mod, Host, Port, Opts) ->
 
 %% send/2
 
-send(Bin, #monitor{socket = Sock,
-                   module = M}) ->
-    case send(M, Sock, Bin) of
-        ok ->
-            ok;
-        {error, Reason} ->
-            x({send, Reason})
-    end;
+send(Bin, #monitor{send_cb = CB} = S) ->
+    send_acts(send_cb(CB, Bin), Bin, S);
 
 %% Send from the monitor process to avoid deadlock if both the
 %% receiver and the peer were to block in send.
 send(Bin, #transport{monitor = MPid}) ->
     MPid ! Bin,
     MPid.
+
+%% send_cb/2
+%%
+%% Callback takes the binary message to be sent, and returns a list of
+%% actions:
+%%
+%%   ok           - send the message
+%%   {ok, Bin}    - send the specified message
+%%   {eval, F}    - evaluate the specified function (without arguments)
+%%
+%% Returning discard is equivalent to [], and {eval, F} is equivalent
+%% to [ok, {eval, F}]. A tail that is not a recognized action is taken
+%% to be a new callback to replace the prevailing one. Any single
+%% action (ie. not a list) can also be returned.
+%%
+%% As opposed to recv_cb, send_cb cannot inject incoming messages,
+%% since reception happens in another process and injection would need
+%% to respect message boundaries: banging it isn't enough.
+
+send_cb(false, _Bin) ->
+    ok;
+
+send_cb(F, Bin) ->
+    diameter_lib:eval([F, Bin]).
+
+%% send_acts/3
+
+send_acts([], _Bin, S) ->
+    S;
+
+send_acts([H|T] = F, Bin, S) ->
+    case send_act(H, Bin, S) of
+        ok ->
+            send_acts(T, Bin, S);
+        false ->
+            S#monitor{send_cb = F}
+    end;
+
+send_acts(discard, _Bin, S) ->
+    S;
+
+send_acts({eval, _} = T, Bin, S) ->
+    send_acts([ok, T], Bin, S);
+
+send_acts(A, Bin, S) ->        
+    send_acts([A], Bin, S).
+
+%% send_act/3
+        
+send_act(ok, Bin, S) ->
+    send1(Bin, S);
+
+send_act({ok, B}, _Bin, S) ->
+    send1(B, S);
+
+send_act({eval, F}, _Bin, _) ->
+    diameter_lib:eval(F),
+    ok;
+
+send_act(_, _Bin, _) ->
+    false.
+
+%% send1/2
+    
+send1(Bin, #monitor{socket = Sock,
+                    module = M}) ->
+    case send(M, Sock, Bin) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            x({send, Reason})
+    end.
 
 %% send/3
 
@@ -878,7 +949,7 @@ setopts(M, Sock, Opts) ->
 
 %% setopts/1
 
-setopts(#transport{socket = Sock, module = M}) ->
+setopts(#transport{socket = Sock, module = M, throttled = false}) ->
     setopts(M, Sock).
 
 %% setopts/2
@@ -897,85 +968,116 @@ throttle(#transport{throttled = false} = S) ->
 
 %% Decide whether to receive another, or whether to accept a message
 %% that's been received.
-throttle(#transport{throttle_cb = F, throttled = T} = S) ->
-    Res = cb(F, T),
-
-    try throttle(Res, S) of
+throttle(#transport{recv_cb = F, throttled = T} = S) ->
+    case recv_acts(recv_cb(F, T), S) of
         #transport{ssl = SB} = NS when is_boolean(SB) ->
             throttle(defrag(NS));
         #transport{throttled = Msg} = NS when is_binary(Msg) ->
             %% Initial incoming message when we might need to upgrade
             %% to TLS: wait for reception of a tls tuple.
-            defrag(NS)
-    catch
-        #transport{} = NS ->
+            defrag(NS);
+        {ok, #transport{} = NS} ->
             recv(NS)
     end.
 
-%% cb/2
+%% recv_cb/2
+%%
+%% Callback gets one argument, a binary message if one has been read
+%% (aka receive callback) or false if not (aka read callback), and
+%% returns a list of actions:
+%%
+%%   ok                  - read or receive a message
+%%   Pid                 - receive a message and send Pid one of
+%%                         {diameter, {request | answer, pid()} | discard},
+%%                         depending on whether the message is sent
+%%                         to the specified handler process or discarded.
+%%   {ok | Pid, Bin}     - receive the specified message
+%%   {send, Bin}         - send the specified message
+%%   {timeout, Tmo}      - ask again in Tmo ms
+%%
+%% A bare Pid is only valid for a receive callback. A tail that is not
+%% a recognized action is taken to be a new callback to replace the
+%% prevailing one, as is as non-empty tail following an ok return to a
+%% read callback or a timeout return to both read and receive
+%% callbacks. Any single action (ie. not a list) can also be returned.
+%% Returning discard is equivalent to [].
+%%
+%% The first callback always has false as argument. Notifications may
+%% not be received after the transport process in which callbacks take
+%% place has died.
 
-cb(false, _) ->
+recv_cb(false, _) ->
     ok;
 
-cb(F, B) ->
+recv_cb(F, B) ->
     diameter_lib:eval([F, true /= B andalso B]).
 
-%% throttle/2
+%% recv_acts/2
 
-%% Callback says to receive another message.
-throttle(ok, #transport{throttled = true} = S) ->
-    throw(S#transport{throttled = false});
+recv_acts([], S) ->
+    S;
 
-%% Callback says to accept a received message.
-throttle(ok, #transport{parent = Pid, throttled = Msg} = S)
+recv_acts([H|T] = F, S) ->
+    case recv_act(H, S) of
+        #transport{} = NS when [] /= T ->
+            {ok, NS#transport{recv_cb = T}};
+        #transport{} = NS ->
+            {ok, NS};
+        ok ->
+            recv_acts(T, S);
+        false ->
+            S#transport{recv_cb = F}
+    end;
+
+recv_acts(discard, S) ->
+    S;
+
+recv_acts(A, S) ->
+    recv_acts([A], S).
+
+%% recv_act/2
+
+%% Read another message.
+recv_act(ok, #transport{throttled = true} = S) ->
+    S#transport{throttled = false};
+
+%% Receive a message.
+recv_act(ok, #transport{parent = Pid, throttled = Msg})
   when is_binary(Msg) ->
     diameter_peer:recv(Pid, Msg),
-    S;
+    ok;
 
-throttle({ok = T, F}, S) ->
-    throttle(T, S#transport{throttle_cb = F});
+%% Receive a specified message.
+recv_act({ok, Bin}, #transport{parent = Pid, throttled = Msg})
+  when is_binary(Msg) ->
+    diameter_peer:recv(Pid, Bin),
+    ok;
 
-%% Callback says to accept a received message and acknowledged the
-%% returned pid with a {request, Pid} message if a request pid is
-%% spawned, a discard message otherwise. The latter does not mean that
-%% the message was necessarily discarded: it could have been an
-%% answer.
-throttle(NPid, #transport{parent = Pid, throttled = Msg} = S)
+%% Receive a message and acknowledge the returned pid with
+%% {request|answer, HandlerPid} or discard.
+recv_act(NPid, #transport{parent = Pid, throttled = Msg})
   when is_pid(NPid), is_binary(Msg) ->
     diameter_peer:recv(Pid, {Msg, NPid}),
-    S;
+    ok;
 
-throttle({NPid, F}, #transport{throttled = Msg} = S)
+%% Receive the specified message and acknowledge.
+recv_act({NPid, Bin}, #transport{parent = Pid, throttled = Msg})
   when is_pid(NPid), is_binary(Msg) ->
-    throttle(NPid, S#transport{throttle_cb = F});
+    diameter_peer:recv(Pid, {Bin, NPid}),
+    ok;
 
-%% Callback to accept a received message says to discard it.
-throttle(discard, #transport{throttled = Msg} = S)
-  when is_binary(Msg) ->
-    S;
-throttle({discard = T, F}, #transport{throttled = Msg} = S)
-  when is_binary(Msg) ->
-    throttle(T, S#transport{throttle_cb = F});
-
-%% Callback to accept a received message says to answer it with the
-%% supplied binary.
-throttle(Bin, #transport{throttled = Msg} = S)
-  when is_binary(Bin), is_binary(Msg) ->
+%% Send the specified message.
+recv_act({send, Bin}, S) ->
     send(Bin, S),
-    S;
-throttle({Bin, F}, #transport{throttled = Msg} = S)
-  when is_binary(Bin), is_binary(Msg) ->
-    throttle(Bin, S#transport{throttle_cb = F});
+    ok;
 
-%% Callback says to ask again in the specified number of milliseconds.
-throttle({timeout, Tmo}, S) ->
+%% Ask again in the specified number of milliseconds.
+recv_act({timeout, Tmo}, S) ->
     erlang:send_after(Tmo, self(), throttle),
-    throw(S);
-throttle({timeout = T, Tmo, F}, S) ->
-    throttle({T, Tmo}, S#transport{throttle_cb = F});
+    S;
 
-throttle(T, #transport{throttle_cb = F}) ->
-    ?ERROR({invalid_return, T, F}).
+recv_act(_, _) ->
+    false.
 
 %% defrag/1
 %%
