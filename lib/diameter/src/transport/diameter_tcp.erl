@@ -124,6 +124,7 @@
          flush = false :: boolean(),            %% flush fragment at timeout?
          recv_cb :: false | diameter:evaluable(), %% ask to read/receive
          throttled :: boolean() | binary(),     %% stopped receiving?
+         q = {0, queue:new()} :: {non_neg_integer(), queue:queue()}, %% inject
          monitor   :: pid()}).                  %% monitor/sender process
 
 %% The usual transport using gen_tcp can be replaced by anything
@@ -591,6 +592,13 @@ transition({P, Sock, Bin}, #transport{socket = Sock,
     false = T,  %% assert
     recv(Bin, S);
 
+%% Incoming message from a send_cb: only inject the new message
+%% at a message boundary on the socket.
+transition({recv, MPid, Bin}, #transport{monitor = MPid,
+                                         q = {N,Q}}
+                              = S) ->
+    recv(S#transport{q = {N+1, queue:in(Bin, Q)}});
+
 %% Make a new throttling callback after a timeout.
 transition(throttle, #transport{throttled = false}) ->
     ok;
@@ -701,11 +709,16 @@ tls(accept, Sock, Opts) ->
 %% using Nagle.
 
 %% Receive packets until a full message is received,
-recv(Bin, #transport{frag = Head, throttled = false} = S) ->
+recv(Bin, #transport{frag = Head, q = {N,Q}, throttled = false} = S) ->
     case rcv(Head, Bin) of
-        {Msg, B} ->
+        {Msg, B} ->         %% have a compete message ...
             throttle(S#transport{frag = B, throttled = Msg});
-        Frag ->
+        Frag when 0 < N ->  %% receive injected messages
+            {{value, Bin}, NQ} = queue:out(Q),
+            throttle(S#transport{frag = Frag,
+                                 q = {N-1, NQ},
+                                 throttled = Bin});
+        Frag ->             %% read more on the socket
             setopts(S),
             start_fragment_timer(S#transport{frag = Frag,
                                              flush = false})
@@ -864,16 +877,13 @@ send(Bin, #transport{monitor = MPid}) ->
 %%
 %%   ok           - send the message
 %%   {ok, Bin}    - send the specified message
+%%   {recv, Bin}  - receive the specified message, subject to recv_cb
 %%   {eval, F}    - evaluate the specified function (without arguments)
 %%
 %% Returning discard is equivalent to [], and {eval, F} is equivalent
 %% to [ok, {eval, F}]. A tail that is not a recognized action is taken
 %% to be a new callback to replace the prevailing one. Any single
 %% action (ie. not a list) can also be returned.
-%%
-%% As opposed to recv_cb, send_cb cannot inject incoming messages,
-%% since reception happens in another process and injection would need
-%% to respect message boundaries: banging it isn't enough.
 
 send_cb(false, _Bin) ->
     ok;
@@ -910,6 +920,10 @@ send_act(ok, Bin, S) ->
 
 send_act({ok, B}, _Bin, S) ->
     send1(B, S);
+
+send_act({recv, B}, _Bin, #monitor{transport = TPid}) ->
+    TPid ! {recv, self(), B},
+    ok;
 
 send_act({eval, F}, _Bin, _) ->
     diameter_lib:eval(F),
@@ -992,7 +1006,7 @@ throttle(#transport{recv_cb = F, throttled = T} = S) ->
 %%                         depending on whether the message is sent
 %%                         to the specified handler process or discarded.
 %%   {ok | Pid, Bin}     - receive the specified message
-%%   {send, Bin}         - send the specified message
+%%   {send, Bin}         - send the specified message, subject to send_cb
 %%   {timeout, Tmo}      - ask again in Tmo ms
 %%
 %% A bare Pid is only valid for a receive callback. A tail that is not
