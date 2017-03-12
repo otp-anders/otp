@@ -123,6 +123,7 @@
          tref = false  :: false | reference(),  %% fragment timer reference
          flush = false :: boolean(),            %% flush fragment at timeout?
          recv_cb :: false | diameter:evaluable(), %% ask to read/receive
+         ack = false :: pid() | false,          %% for recv_cb
          throttled :: boolean() | binary(),     %% stopped receiving?
          q = {0, queue:new()} :: {non_neg_integer(), queue:queue()}, %% inject
          monitor   :: pid()}).                  %% monitor/sender process
@@ -875,18 +876,17 @@ send(Bin, #transport{monitor = MPid}) ->
 %% Callback takes the binary message to be sent, and returns a list of
 %% actions:
 %%
-%%   ok           - send the message
-%%   {ok, Bin}    - send the specified message
-%%   {recv, Bin}  - receive the specified message, subject to recv_cb
-%%   {eval, F}    - evaluate the specified function (without arguments)
+%%   send            - send the message
+%%   {send, Bin}     - send the specified message
+%%   {recv, Bin}     - receive the specified message, subject to recv_cb
+%%   {eval, F}       - evaluate the specified function (without arguments)
 %%
-%% Returning discard is equivalent to [], and {eval, F} is equivalent
-%% to [ok, {eval, F}]. A tail that is not a recognized action is taken
-%% to be a new callback to replace the prevailing one. Any single
-%% action (ie. not a list) can also be returned.
+%% A tail that is not a recognized action is taken to be a new
+%% callback to replace the prevailing one. Any single action (ie. not
+%% a list) can also be returned.
 
 send_cb(false, _Bin) ->
-    ok;
+    send;
 
 send_cb(F, Bin) ->
     diameter_lib:eval([F, Bin]).
@@ -904,21 +904,18 @@ send_acts([H|T] = F, Bin, S) ->
             S#monitor{send_cb = F}
     end;
 
-send_acts(discard, _Bin, S) ->
-    S;
-
-send_acts({eval, _} = T, Bin, S) ->
-    send_acts([ok, T], Bin, S);
+send_acts(ok, Bin, S) ->
+    send_acts([send], Bin, S);
 
 send_acts(A, Bin, S) ->        
     send_acts([A], Bin, S).
 
 %% send_act/3
         
-send_act(ok, Bin, S) ->
+send_act(send, Bin, S) ->
     send1(Bin, S);
 
-send_act({ok, B}, _Bin, S) ->
+send_act({send, B}, _Bin, S) ->
     send1(B, S);
 
 send_act({recv, B}, _Bin, #monitor{transport = TPid}) ->
@@ -1000,28 +997,28 @@ throttle(#transport{recv_cb = F, throttled = T} = S) ->
 %% (aka receive callback) or false if not (aka read callback), and
 %% returns a list of actions:
 %%
-%%   ok                  - read or receive a message
-%%   Pid                 - receive a message and send Pid one of
+%%   recv                - read or receive a message
+%%   {recv, Bin}         - receive the specified message
+%%   {ack, Pid}          - process which should receive one of
 %%                         {diameter, {request | answer, pid()} | discard},
-%%                         depending on whether the message is sent
-%%                         to the specified handler process or discarded.
-%%   {ok | Pid, Bin}     - receive the specified message
+%%                         for each subsequent recv, depending on whether
+%%                         the message is sent to the specified handler
+%%                         process or discarded
 %%   {send, Bin}         - send the specified message, subject to send_cb
 %%   {timeout, Tmo}      - ask again in Tmo ms
 %%
-%% A bare Pid is only valid for a receive callback. A tail that is not
-%% a recognized action is taken to be a new callback to replace the
-%% prevailing one, as is as non-empty tail following an ok return to a
-%% read callback or a timeout return to both read and receive
+%% An ack is only valid for a receive callback. A tail that is not a
+%% recognized action is taken to be a new callback to replace the
+%% prevailing one, as is as non-empty tail following a recv return to
+%% a read callback or a timeout return to both read and receive
 %% callbacks. Any single action (ie. not a list) can also be returned.
-%% Returning discard is equivalent to [].
 %%
-%% The first callback always has false as argument. Notifications may
-%% not be received after the transport process in which callbacks take
-%% place has died.
+%% The first callback always has false as argument. Acknowledgements
+%% may not be received after the transport process in which callbacks
+%% take place has died.
 
 recv_cb(false, _) ->
-    ok;
+    recv;
 
 recv_cb(F, B) ->
     diameter_lib:eval([F, true /= B andalso B]).
@@ -1033,18 +1030,20 @@ recv_acts([], S) ->
 
 recv_acts([H|T] = F, S) ->
     case recv_act(H, S) of
-        #transport{} = NS when [] /= T ->
+        {ok, #transport{} = NS} when [] /= T ->
             {ok, NS#transport{recv_cb = T}};
-        #transport{} = NS ->
-            {ok, NS};
+        {ok, #transport{}} = Ok ->
+            Ok;
+        false ->
+            S#transport{recv_cb = F};
         ok ->
             recv_acts(T, S);
-        false ->
-            S#transport{recv_cb = F}
+        #transport{} = NS ->
+            recv_acts(T, NS)
     end;
 
-recv_acts(discard, S) ->
-    S;
+recv_acts(ok, S) ->
+    recv_acts([recv], S);
 
 recv_acts(A, S) ->
     recv_acts([A], S).
@@ -1052,32 +1051,19 @@ recv_acts(A, S) ->
 %% recv_act/2
 
 %% Read another message.
-recv_act(ok, #transport{throttled = true} = S) ->
-    S#transport{throttled = false};
+recv_act(recv, #transport{throttled = true} = S) ->
+    {ok, S#transport{throttled = false}};
 
 %% Receive a message.
-recv_act(ok, #transport{parent = Pid, throttled = Msg})
+recv_act(recv, #transport{parent = Pid, throttled = Msg, ack = NPid})
   when is_binary(Msg) ->
-    diameter_peer:recv(Pid, Msg),
+    diameter_peer:recv(Pid, ack(Msg, NPid)),
     ok;
 
 %% Receive a specified message.
-recv_act({ok, Bin}, #transport{parent = Pid, throttled = Msg})
+recv_act({recv, Bin}, #transport{parent = Pid, throttled = Msg, ack = NPid})
   when is_binary(Msg) ->
-    diameter_peer:recv(Pid, Bin),
-    ok;
-
-%% Receive a message and acknowledge the returned pid with
-%% {request|answer, HandlerPid} or discard.
-recv_act(NPid, #transport{parent = Pid, throttled = Msg})
-  when is_pid(NPid), is_binary(Msg) ->
-    diameter_peer:recv(Pid, {Msg, NPid}),
-    ok;
-
-%% Receive the specified message and acknowledge.
-recv_act({NPid, Bin}, #transport{parent = Pid, throttled = Msg})
-  when is_pid(NPid), is_binary(Msg) ->
-    diameter_peer:recv(Pid, {Bin, NPid}),
+    diameter_peer:recv(Pid, ack(Bin, NPid)),
     ok;
 
 %% Send the specified message.
@@ -1085,13 +1071,27 @@ recv_act({send, Bin}, S) ->
     send(Bin, S),
     ok;
 
+%% A pid to receive {request|answer, HandlerPid} or discard acknowledgements.
+recv_act({ack, NPid}, S)
+  when is_pid(NPid);
+       not NPid ->
+    S#transport{ack = NPid};
+
 %% Ask again in the specified number of milliseconds.
 recv_act({timeout, Tmo}, S) ->
     erlang:send_after(Tmo, self(), throttle),
-    S;
+    {ok, S};
 
 recv_act(_, _) ->
     false.
+
+%% ack/2
+
+ack(Msg, false) ->
+    Msg;
+
+ack(Msg, NPid) ->
+    {Msg, NPid}.
 
 %% defrag/1
 %%
