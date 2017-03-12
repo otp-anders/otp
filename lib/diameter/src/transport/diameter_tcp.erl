@@ -89,6 +89,7 @@
 -type length() :: 0..16#FFFFFF. %% message length from Diameter header
 -type size()   :: non_neg_integer().  %% accumulated binary size
 -type frag()   :: {length(), size(), binary(), list(binary())}
+                | {binary(), [binary()]}
                 | binary().
 
 -type connect_option() :: {raddr, inet:ip_address()}
@@ -117,11 +118,13 @@
         {socket  :: inet:socket() | ssl:sslsocket(), %% accept/connect socket
          parent  :: pid(),          %% of process that started us
          module  :: module(),       %% gen_tcp-like module
-         frag = <<>> :: frag(),     %% message fragment
          ssl     :: [term()] | boolean(),       %% ssl options, ssl or not
+         frag = <<>> :: frag(),                 %% message fragment
          timeout :: infinity | 0..16#FFFFFFFF,  %% fragment timeout
          tref = false  :: false | reference(),  %% fragment timer reference
          flush = false :: boolean(),            %% flush fragment at timeout?
+         pending = 0 :: non_neg_integer(),      %% pending count on socket
+         reset :: {pos_integer(), non_neg_integer()}, %% active N reset
          recv_cb :: false | diameter:evaluable(), %% ask to read/receive
          ack = false :: pid() | false,          %% for recv_cb
          throttled :: boolean() | binary(),     %% stopped receiving?
@@ -231,6 +234,7 @@ i({T, Ref, Mod, Pid, Opts, Addrs, SPid})
                                                        send_cb = Send}),
     Sock = init(T, Ref, Mod, Pid, SslOpts, Rest, Addrs, SPid),
     M = if SslOpts -> ssl; true -> Mod end,
+    Reset = if not SslOpts -> {4,2}; true -> {1,0} end, %% no N in ssl yet
     monitor(process, MPid),
     MPid ! {start, self(), Sock, M}, %% prepare monitor for sending
     putr(?REF_KEY, Ref),
@@ -241,6 +245,7 @@ i({T, Ref, Mod, Pid, Opts, Addrs, SPid})
                         timeout = Tmo,
                         recv_cb = Recv,
                         throttled = false /= Recv,
+                        reset = Reset,
                         monitor = MPid});
 %% Put the reference in the process dictionary since we now use it
 %% advertise the ssl socket after TLS upgrade.
@@ -583,15 +588,19 @@ t(T,S) ->
 
 %% transition/2
 
-%% Incoming message.
+%% Incoming packets.
 transition({P, Sock, Bin}, #transport{socket = Sock,
                                       ssl = B,
-                                      throttled = T}
+                                      pending = K}
                            = S)
   when P == ssl, true == B;
        P == tcp ->
-    false = T,  %% assert
-    recv(Bin, S);
+    true = 0 < K,  %% assert
+    recv(Bin, S#transport{pending = K-1});
+
+%% TCP Socket is passive. SSL socket uses {active, once}.
+transition({tcp_passive, Sock}, #transport{socket = Sock}) ->
+    ok;
 
 %% Incoming message from a send_cb: only inject the new message
 %% at a message boundary on the socket.
@@ -697,7 +706,7 @@ tls_handshake(Type, true, #transport{socket = Sock,
 
 %% Capabilities exchange has not negotiated TLS.
 tls_handshake(_, false, S) ->
-    S.
+    S#transport{reset = {4,2}}.
 
 tls(connect, Sock, Opts) ->
     ssl:connect(Sock, Opts);
@@ -712,21 +721,24 @@ tls(accept, Sock, Opts) ->
 %% Receive packets until a full message is received,
 recv(Bin, #transport{frag = Head, q = {N,Q}, throttled = false} = S) ->
     case rcv(Head, Bin) of
-        {Msg, B} ->         %% have a compete message ...
-            throttle(S#transport{frag = B, throttled = Msg});
+        {Msg, Bs} ->         %% have a compete message ...
+            throttle(S#transport{frag = bin(Bs), throttled = Msg});
         Frag when 0 < N ->  %% receive injected messages
             {{value, Bin}, NQ} = queue:out(Q),
             throttle(S#transport{frag = Frag,
                                  q = {N-1, NQ},
                                  throttled = Bin});
         Frag ->             %% read more on the socket
-            setopts(S),
-            start_fragment_timer(S#transport{frag = Frag,
-                                             flush = false})
-    end.
+            start_fragment_timer(setopts(S#transport{frag = Frag,
+                                                     flush = false}))
+    end;
+
+%% Receive packets while throttling.
+recv(Bin, #transport{frag = Head} = S) ->
+    S#transport{frag = rcv(Head, Bin)}.
 
 %% recv/1
-
+ 
 recv(#transport{throttled = false} = S) ->
     recv(<<>>, S);
 
@@ -734,6 +746,10 @@ recv(#transport{} = S) ->
     S.
 
 %% rcv/2
+
+%% Message already extracted.
+rcv({Msg, Bs}, Bin) ->
+    {Msg, [Bin | Bs]};
 
 %% No previous fragment.
 rcv(<<>>, Bin) ->
@@ -771,7 +787,7 @@ rcv(<<>> = Bin) ->
 %% simply receiving them. Make it so.
 rcv(<<_:1/binary, Len:24, _/binary>> = Bin)
   when Len < 20 ->
-    {Bin, <<>>};
+    {Bin, []};
 
 %% Enough bytes to extract a message.
 rcv(<<_:1/binary, Len:24, _/binary>> = Bin)
@@ -790,15 +806,22 @@ rcv(Head) ->
 
 recv1(Len, Bin) ->
     <<Msg:Len/binary, Rest/binary>> = Bin,
-    {Msg, Rest}.
+    {Msg, [Rest]}.
 
-%% bin/1-2
+%% bin/2
 
 bin(Head, Acc) ->
     list_to_binary([Head | lists:reverse(Acc)]).
 
+%% bin/1
+
 bin({_, _, Head, Acc}) ->
     bin(Head, Acc);
+
+bin(Bs)
+  when is_list(Bs) ->
+    bin(<<>>, Bs);
+
 bin(Bin)
   when is_binary(Bin) ->
     Bin.
@@ -960,15 +983,28 @@ setopts(M, Sock, Opts) ->
 
 %% setopts/1
 
-setopts(#transport{socket = Sock, module = M, throttled = false}) ->
-    setopts(M, Sock).
+setopts(#transport{socket = Sock,
+                   module = M,
+                   throttled = false,
+                   pending = K,
+                   reset = {N,L}}
+        = S)
+  when K =< L ->
+    active(N, M, Sock),
+    S#transport{pending = K+N};
 
-%% setopts/2
+setopts(S) ->
+    S.
 
-setopts(M, Sock) ->
-    case setopts(M, Sock, [{active, once}]) of
+%% active/3
+
+active(1, M, Sock) ->
+    active(once, M, Sock);
+
+active(N, M, Sock) ->
+    case setopts(M, Sock, [{active, N}]) of
         ok -> ok;
-        X  -> x({setopts, M, Sock, X})  %% possibly on peer disconnect
+        X  -> x({setopts, M, Sock, N, X})  %% possibly on peer disconnect
     end.
 
 %% throttle/1
@@ -1100,8 +1136,8 @@ ack(Msg, NPid) ->
 
 defrag(#transport{frag = Head} = S) ->
     case rcv(Head, <<>>) of
-        {Msg, B} ->
-            S#transport{throttled = Msg, frag = B};
+        {Msg, Bs} ->
+            S#transport{throttled = Msg, frag = bin(Bs)};
         _ ->
             S#transport{throttled = true}
     end.
