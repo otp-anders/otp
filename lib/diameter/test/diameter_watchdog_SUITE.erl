@@ -44,13 +44,8 @@
 -export([peer_up/3,
          peer_down/3]).
 
-%% gen_tcp-ish interface
--export([listen/2,
-         accept/1,
-         connect/3,
-         send/2,
-         setopts/2,
-         close/1]).
+%% diameter_tcp send_cb
+-export([send/2]).
 
 -include("diameter.hrl").
 -include("diameter_ct.hrl").
@@ -163,7 +158,7 @@ reopen(Type, Test, Ref, Wd, N, M) ->
 cfg(Type, Type, Wd) ->
     {Wd, [], []};
 cfg(_Type, _Test, _Wd) ->
-    {?WD(?PEER_WD), [{okay, 0}], [{module, ?MODULE}]}.
+    {?WD(?PEER_WD), [{okay, 0}], [{send_cb, [fun send/2, capx]}]}.
 
 %% reopen/7
 
@@ -437,7 +432,7 @@ abuse(F, Test) ->
     abuse([F], Test).
 
 mod(true) ->
-    [{module, ?MODULE}];
+    [{send_cb, [fun send/2, capx]}];
 mod(false) ->
     [].
 
@@ -531,37 +526,18 @@ cfg(connect, Ref) ->
 
 %% ===========================================================================
 
-listen(PortNr, Opts) ->
-    gen_tcp:listen(PortNr, Opts).
-
-accept(LSock) ->
-    gen_tcp:accept(LSock).
-
-connect(Addr, Port, Opts) ->
-    gen_tcp:connect(Addr, Port, Opts).
-
-setopts(Sock, Opts) ->
-    inet:setopts(Sock, Opts).
-
-send(Sock, Bin) ->
-    send(getr(config), Sock, Bin).
-
-close(Sock) ->
-    gen_tcp:close(Sock).
-
-%% send/3
+%% send/2
 
 %% First outgoing message from a new transport process is CER/CEA.
 %% Remaining outgoing messages are either DWR or DWA.
-send(undefined, Sock, Bin) ->
-    <<_:32, _:8, 257:24, _/binary>> = Bin,
-    putr(config, init),
-    gen_tcp:send(Sock, Bin);
+send(Bin, capx) ->
+    <<_:32, _:8, 257:24, _/binary>> = Bin,  %% assert on CER/CEA
+    [send, fun send/2, init];
 
 %% Outgoing DWR: fake reception of DWA. Use the fact that AVP values
 %% are ignored. This is to ensure that the peer's watchdog state
 %% transitions are only induced by responses to messages it sends.
-send(_, Sock, <<_:32, 1:1, _:7, 280:24, _:32, EId:32, HId:32, _/binary>>) ->
+send(<<_:32, 1:1, _:7, 280:24, _:32, EId:32, HId:32, _/binary>>, _) ->
     Pkt = #diameter_packet{header = #diameter_header{version = 1,
                                                      end_to_end_id = EId,
                                                      hop_by_hop_id = HId},
@@ -569,55 +545,43 @@ send(_, Sock, <<_:32, 1:1, _:7, 280:24, _:32, EId:32, HId:32, _/binary>>) ->
                                          {'Origin-Host', "XXX"},
                                          {'Origin-Realm', ?REALM}]},
     #diameter_packet{bin = Bin} = diameter_codec:encode(?BASE, Pkt),
-    tpid(Sock) ! {tcp, Sock, Bin},
-    ok;
+    [{recv, Bin}];
 
 %% First outgoing DWA.
-send(init, Sock, Bin) ->
-    [{{?MODULE, _, T}, _}] = diameter_reg:wait({?MODULE, tpid(Sock), '_'}),
-    putr(config, T),
-    send(Sock, Bin);
+send(Bin, init) ->
+    [{{?MODULE, _, T}, _}] = diameter_reg:wait({?MODULE, tpid(), '_'}),
+    send(Bin, T);
 
 %% First transport process.
-send({SvcName, {_,_,_} = T}, Sock, Bin) ->
+send(Bin, {SvcName, {_,_,_} = T}) ->
     [{'Origin-Host', _} = OH, {'Origin-Realm', _} = OR | _]
         = ?SERVICE(SvcName),
     putr(origin, [OH, OR]),
-    putr(config, T),
-    send(Sock, Bin);
+    send(Bin, T);
 
 %% Discard DWA, failback after another timeout in the peer.
-send({Wd, 0 = No, Msg}, Sock, Bin) ->
+send(Bin, {Wd, 0 = No, Msg}) ->
     Origin = getr(origin),
-    spawn(fun() -> failback(?ONE_WD(Wd), Msg, Sock, Bin, Origin) end),
-    putr(config, No),
-    ok;
+    [{defer, ?ONE_WD(Wd), [{send, msg(Msg, Bin, Origin)}]}, fun send/2, No];
 
 %% Send DWA while we're in the mood (aka 0 < N).
-send({Wd, N, Msg}, Sock, Bin) ->
-    putr(config, {Wd, N-1, Msg}),
-    gen_tcp:send(Sock, Bin);
+send(_Bin, {Wd, N, Msg}) ->
+    [send, fun send/2, {Wd, N-1, Msg}];
 
 %% Discard DWA.
-send(0, _Sock, _Bin) ->
-    ok;
+send(_Bin, 0 = No) ->
+    [fun send/2, No];
 
 %% Send DWA.
-send(N, Sock, <<_:32, 0:1, _:7, 280:24, _/binary>> = Bin) ->
-    putr(config, N-1),
-    gen_tcp:send(Sock, Bin).
+send(<<_:32, 0:1, _:7, 280:24, _/binary>>, N) ->
+    [send, fun send/2, N-1].
 
-%% tpid/1
+%% tpid/0
 
-tpid(Sock) ->
-    {connected, Pid} = erlang:port_info(Sock, connected),
-    Pid.
-
-%%failback/5
-
-failback(Tmo, Msg, Sock, Bin, Origin) ->
-    timer:sleep(Tmo),
-    ok = gen_tcp:send(Sock, msg(Msg, Bin, Origin)).
+tpid() ->
+    {_, Dict} = process_info(self(), dictionary),
+    {_, TPid} = lists:keyfind({diameter_tcp, transport}, 1, Dict),
+    TPid.
 
 %% msg/2
 
