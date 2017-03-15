@@ -126,7 +126,6 @@
          pending = 0 :: non_neg_integer(),      %% pending count on socket
          reset :: {pos_integer(), non_neg_integer()}, %% active N reset
          recv_cb :: false | diameter:evaluable(), %% ask to read/receive
-         ack = false :: pid() | false,          %% for recv_cb
          throttled :: boolean() | binary(),     %% stopped receiving?
          q = {0, queue:new()} :: {non_neg_integer(), queue:queue()}, %% inject
          monitor   :: pid()}).                  %% monitor/sender process
@@ -548,6 +547,10 @@ m({tls, SSock}, #monitor{} = S) ->
     S#monitor{socket = SSock,
               module = ssl};
 
+%% Deferred actions from a send_cb.
+m({actions, Acts, Bin}, #monitor{} = S) ->
+    send_acts(Acts, Bin, S);
+
 %% Transport or parent has died.
 m({'DOWN', M, process, P, _} = T, #monitor{parent = MRef,
                                            transport = TPid})
@@ -669,6 +672,10 @@ transition({'DOWN', _, process, Pid, _}, #transport{parent = Pid,
         orelse exit(MPid, kill),
     stop;
 
+%% Deferred actions from a recv_cb.
+transition({actions, Acts}, #transport{} = S) ->
+    throttle(Acts, S);
+
 %% Monitor process has died.
 transition({'DOWN', _, process, MPid, _}, #transport{monitor = MPid}) ->
     stop.
@@ -724,10 +731,10 @@ recv(Bin, #transport{frag = Head, q = {N,Q}, throttled = false} = S) ->
         {Msg, Bs} ->         %% have a compete message ...
             throttle(S#transport{frag = bin(Bs), throttled = Msg});
         Frag when 0 < N ->  %% receive injected messages
-            {{value, Bin}, NQ} = queue:out(Q),
+            {{value, B}, NQ} = queue:out(Q),
             throttle(S#transport{frag = Frag,
                                  q = {N-1, NQ},
-                                 throttled = Bin});
+                                 throttled = B});
         Frag ->             %% read more on the socket
             start_fragment_timer(setopts(S#transport{frag = Frag,
                                                      flush = false}))
@@ -903,6 +910,7 @@ send(Bin, #transport{monitor = MPid}) ->
 %%   {send, Bin}     - send the specified message
 %%   {recv, Bin}     - receive the specified message, subject to recv_cb
 %%   {eval, F}       - evaluate the specified function (without arguments)
+%%   {defer, Tmo, [Action]}  - process actions Tmo milliseconds in the future
 %%
 %% A tail that is not a recognized action is taken to be a new
 %% callback to replace the prevailing one. Any single action (ie. not
@@ -947,6 +955,10 @@ send_act({recv, B}, _Bin, #monitor{transport = TPid}) ->
 
 send_act({eval, F}, _Bin, _) ->
     diameter_lib:eval(F),
+    ok;
+
+send_act({defer, Tmo, Acts}, Bin, _) ->
+    erlang:send_after(Tmo, self(), {actions, Acts, Bin}),
     ok;
 
 send_act(_, _Bin, _) ->
@@ -1016,7 +1028,12 @@ throttle(#transport{throttled = false} = S) ->
 %% Decide whether to receive another, or whether to accept a message
 %% that's been received.
 throttle(#transport{recv_cb = F, throttled = T} = S) ->
-    case recv_acts(recv_cb(F, T), S) of
+    throttle(recv_cb(F, T), S).
+
+%% throttle/2
+
+throttle(Actions, S) ->
+    case recv_acts(Actions, false, S) of
         #transport{ssl = SB} = NS when is_boolean(SB) ->
             throttle(defrag(NS));
         #transport{throttled = Msg} = NS when is_binary(Msg) ->
@@ -1037,10 +1054,14 @@ throttle(#transport{recv_cb = F, throttled = T} = S) ->
 %%   {recv, Bin}         - receive the specified message
 %%   {ack, Pid}          - process which should receive one of
 %%                         {diameter, {request | answer, pid()} | discard},
-%%                         for each subsequent recv, depending on whether
-%%                         the message is sent to the specified handler
-%%                         process or discarded
+%%                         for each subsequent recv in the action list,
+%%                         depending on whether the message is sent to the
+%%                         specified handler process or discarded; Pid can
+%%                         be false to disable acknowledgement
 %%   {send, Bin}         - send the specified message, subject to send_cb
+%%   {defer, Tmo, [Action]}
+%%                       - process actions Tmo milliseconds in the future;
+%%                         actions should not include timeout or bare recv
 %%   {timeout, Tmo}      - ask again in Tmo ms
 %%
 %% An ack is only valid for a receive callback. A tail that is not a
@@ -1059,66 +1080,67 @@ recv_cb(false, _) ->
 recv_cb(F, B) ->
     diameter_lib:eval([F, true /= B andalso B]).
 
-%% recv_acts/2
+%% recv_acts/3
 
-recv_acts([], S) ->
+recv_acts([], _, S) ->
     S;
 
-recv_acts([H|T] = F, S) ->
-    case recv_act(H, S) of
-        {ok, #transport{} = NS} when [] /= T ->
+recv_acts([{ack, NPid} | T], _, S)
+  when is_pid(NPid);
+       not NPid ->
+    recv_acts(T, NPid, S);
+
+recv_acts([H|T] = F, NPid, S) ->
+    case recv_act(H, NPid, S) of
+        #transport{} = NS when [] /= T ->
             {ok, NS#transport{recv_cb = T}};
-        {ok, #transport{}} = Ok ->
-            Ok;
+        #transport{} = NS ->
+            {ok, NS};
         false ->
             S#transport{recv_cb = F};
         ok ->
-            recv_acts(T, S);
-        #transport{} = NS ->
-            recv_acts(T, NS)
+            recv_acts(T, NPid, S)
     end;
 
-recv_acts(ok, S) ->
-    recv_acts([recv], S);
+recv_acts(ok, NPid, S) ->
+    recv_acts([recv], NPid, S);
 
-recv_acts(A, S) ->
-    recv_acts([A], S).
+recv_acts(A, NPid, S) ->
+    recv_acts([A], NPid, S).
 
-%% recv_act/2
+%% recv_act/3
 
 %% Read another message.
-recv_act(recv, #transport{throttled = true} = S) ->
-    {ok, S#transport{throttled = false}};
+recv_act(recv, _, #transport{throttled = true} = S) ->
+    S#transport{throttled = false};
 
 %% Receive a message.
-recv_act(recv, #transport{parent = Pid, throttled = Msg, ack = NPid})
+recv_act(recv, NPid, #transport{parent = Pid, throttled = Msg})
   when is_binary(Msg) ->
     diameter_peer:recv(Pid, ack(Msg, NPid)),
     ok;
 
 %% Receive a specified message.
-recv_act({recv, Bin}, #transport{parent = Pid, throttled = Msg, ack = NPid})
+recv_act({recv, Bin}, NPid, #transport{parent = Pid, throttled = Msg})
   when is_binary(Msg) ->
     diameter_peer:recv(Pid, ack(Bin, NPid)),
     ok;
 
 %% Send the specified message.
-recv_act({send, Bin}, S) ->
+recv_act({send, Bin}, _, S) ->
     send(Bin, S),
     ok;
 
-%% A pid to receive {request|answer, HandlerPid} or discard acknowledgements.
-recv_act({ack, NPid}, S)
-  when is_pid(NPid);
-       not NPid ->
-    S#transport{ack = NPid};
+recv_act({defer, Tmo, Acts}, _, _) ->
+    erlang:send_after(Tmo, self(), {actions, Acts}),
+    ok;
 
 %% Ask again in the specified number of milliseconds.
-recv_act({timeout, Tmo}, S) ->
+recv_act({timeout, Tmo}, _, S) ->
     erlang:send_after(Tmo, self(), throttle),
-    {ok, S};
+    S;
 
-recv_act(_, _) ->
+recv_act(_, _, _) ->
     false.
 
 %% ack/2
