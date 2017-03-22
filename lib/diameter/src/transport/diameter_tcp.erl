@@ -531,10 +531,11 @@ getr(Key) ->
 %% Transition monitor state.
 
 %% Outgoing message.
-m(B, #monitor{} = S)
-  when is_binary(B);
-       false == B ->
-    send(B, S);
+m(M, #monitor{} = S)
+  when is_binary(M);
+       false == M;
+       is_record(M, diameter_packet) ->
+    send(M, S);
 
 %% Transport is telling us to be ready to send. Stop monitoring on the
 %% parent so as not to die before a send from the transport.
@@ -647,8 +648,8 @@ transition({E, Sock, _Reason} = T, #transport{socket = Sock,
     ?ERROR({T,S});
 
 %% Outgoing message.
-transition({diameter, {send, Bin}}, #transport{} = S) ->
-    send(Bin, S),
+transition({diameter, {send, Msg}}, #transport{} = S) ->
+    send(Msg, S),
     ok;
 
 %% Request to close the transport connection.
@@ -897,20 +898,21 @@ connect(Mod, Host, Port, Opts) ->
 
 %% send/2
 
-send(Bin, #monitor{send_cb = CB} = S) ->
-    send_acts(send_cb(CB, Bin), Bin, S);
+send(Msg, #monitor{send_cb = CB} = S) ->
+    send_acts(send_cb(CB, Msg), Msg, S);
 
 %% Send from the monitor process to avoid deadlock if both the
 %% receiver and the peer were to block in send.
-send(Bin, #transport{monitor = MPid}) ->
-    MPid ! Bin,
+send(Msg, #transport{monitor = MPid}) ->
+    MPid ! Msg,
     MPid.
 
 %% send_cb/2
 %%
-%% Callback takes the binary message to be sent or false (if a message
-%% setting the request bit is unanswered and recv_cb has requested
-%% acknowledgements), and returns a list of actions:
+%% Callback takes the binary (or diameter_packet) message to be sent
+%% or false (if a message setting the request bit is unanswered and
+%% recv_cb has requested acknowledgements), and returns a list of
+%% actions:
 %%
 %%   send            - send the message
 %%   {send, Bin}     - send the specified message
@@ -930,49 +932,54 @@ send_cb(F, Bin) ->
 
 %% send_acts/3
 
-send_acts([], _Bin, S) ->
+send_acts([], _Msg, S) ->
     S;
 
-send_acts([H|T] = F, Bin, S) ->
-    case send_act(H, Bin, S) of
+send_acts([H|T] = F, Msg, S) ->
+    case send_act(H, Msg, S) of
         ok ->
-            send_acts(T, Bin, S);
+            send_acts(T, Msg, S);
         false ->
             S#monitor{send_cb = F}
     end;
 
-send_acts(ok, Bin, S) ->
-    send_acts([send], Bin, S);
+send_acts(ok, Msg, S) ->
+    send_acts([send], Msg, S);
 
-send_acts(A, Bin, S) ->        
-    send_acts([A], Bin, S).
+send_acts(A, Msg, S) ->        
+    send_acts([A], Msg, S).
 
 %% send_act/3
         
-send_act(send, Bin, S)
-  when false /= Bin ->
+send_act(send, Msg, S)
+  when false /= Msg ->
+    send1(Msg, S);
+
+send_act({send, Bin}, _Msg, S)
+  when is_binary(Bin) ->
     send1(Bin, S);
 
-send_act({send, B}, _Bin, S) ->
-    send1(B, S);
-
-send_act({recv, B}, _Bin, #monitor{transport = TPid}) ->
-    TPid ! {recv, self(), B},
+send_act({recv, Bin}, _Msg, #monitor{transport = TPid})
+  when is_binary(Bin) ->
+    TPid ! {recv, self(), Bin},
     ok;
 
-send_act({eval, F}, _Bin, _) ->
+send_act({eval, F}, _Msg, _) ->
     diameter_lib:eval(F),
     ok;
 
-send_act({defer, Tmo, Acts}, Bin, _) ->
-    erlang:send_after(Tmo, self(), {actions, Acts, Bin}),
+send_act({defer, Tmo, Acts}, Msg, _) ->
+    erlang:send_after(Tmo, self(), {actions, Acts, Msg}),
     ok;
 
-send_act(_, _Bin, _) ->
+send_act(_, _Msg, _) ->
     false.
 
 %% send1/2
-    
+
+send1(#diameter_packet{bin = Bin}, S) ->
+    send1(Bin, S);
+
 send1(Bin, #monitor{socket = Sock,
                     module = M}) ->
     case send(M, Sock, Bin) of
@@ -1061,8 +1068,8 @@ throttle(Actions, S) ->
 %%                         causing send_cb to be invoked on false in the
 %%                         absence of an outgoing answer
 %%   recv                - read or receive a message
-%%   {recv, Bin}         - receive the specified message
-%%   {send, Bin}         - send the specified message, subject to send_cb
+%%   {recv, Msg}         - receive the specified message
+%%   {send, Msg}         - send the specified message, subject to send_cb
 %%   {defer, Tmo, [Action]}
 %%                       - process actions Tmo milliseconds in the future;
 %%                         actions should not include timeout or bare recv
@@ -1124,14 +1131,14 @@ recv_act(recv, #transport{parent = Pid, throttled = Msg})
     ok;
 
 %% Receive a specified message.
-recv_act({recv, Bin}, #transport{parent = Pid, throttled = Msg})
-  when is_binary(Msg) ->
-    diameter_peer:recv(Pid, Bin),
+recv_act({recv, Msg}, #transport{parent = Pid, throttled = M}) 
+  when is_binary(M) ->
+    diameter_peer:recv(Pid, Msg),
     ok;
 
 %% Send the specified message.
-recv_act({send, Bin}, S) ->
-    send(Bin, S),
+recv_act({send, Msg}, S) ->
+    send(Msg, S),
     ok;
 
 recv_act({defer, Tmo, Acts}, _) ->
